@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <title>GeoParquet Viewer</title>
+    <link href="https://unpkg.com/maplibre-gl@latest/dist/maplibre-gl.css" rel="stylesheet" />
+    <script src="https://unpkg.com/maplibre-gl@latest/dist/maplibre-gl.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6.5.0/turf.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+        }
+
+        #map {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            width: 100%;
+        }
+
+        #controls {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            z-index: 10;
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+
+        #info,
+        #selected {
+            position: absolute;
+            right: 10px;
+            background: white;
+            padding: 6px;
+            font-size: 14px;
+            border: 1px solid #ccc;
+            max-width: 300px;
+            overflow-wrap: break-word;
+            z-index: 10;
+        }
+
+        #info {
+            top: 10px;
+        }
+
+        #selected {
+            bottom: 20px;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="controls">
+        <input id="filepath" type="text" placeholder="Enter Parquet file path" style="padding: 6px; width: 250px;" />
+        <button id="refresh">Refresh Map</button>
+        <button onclick="selectFlagged(flaggedSelectedIndex - 1)">Previous Flagged</button>
+        <button onclick="selectFlagged(flaggedSelectedIndex + 1)">Next Flagged</button>
+        <button onclick="zoomToFlagged()">Zoom to Flagged</button>
+        <select id="flagged-select" onchange="handleFlaggedSelectChange()" style="padding: 6px; width: 250px;">
+            <option value="">No flagged shapes available</option>
+        </select>
+    </div>
+
+    <div id="map"></div>
+    <div id="info">Hover over a shape</div>
+    <div id="selected">Click on a shape</div>
+
+    <div id="special-features"
+        style="position: absolute; right: 10px; top: 120px; background: white; padding: 6px; font-size: 14px; border: 1px solid #ccc; max-width: 300px; max-height: 300px; overflow-y: auto; z-index: 10;">
+        <strong>Special Features</strong>
+        <button id="clear-special-features" style="margin-top: 10px; padding: 5px;">Clear</button>
+        <button id="copy-osmwayids" style="margin-top: 10px; padding: 5px;">Copy OsmWayIds</button>
+        <ul id="special-features-list" style="list-style: none; padding: 0; margin: 10px 0;"></ul>
+    </div>
+
+    <script>
+        let map;
+        let hoveredFeatureId = null;
+        let selectedFeatureId = null;
+        let flaggedFeatures = [];
+        let flaggedSelectedIndex = -1;
+
+        // color expression for line color based on factyp, factypes are values between 1 and 20 and i and i + 10 should be the same color
+        let colorExpression = ["match", ["get", "facType"], 1, "#e6194b", 11, "#e6194b", 2, "#3cb44b", 12, "#3cb44b", 3, "#ffe119", 13, "#ffe119", 4, "#4363d8", 14, "#4363d8", 5, "#f58231", 15, "#f58231", 6, "#911eb4", 16, "#911eb4", 7, "#46f0f0", 17, "#46f0f0", 8, "#f032e6", 18, "#f032e6", 9, "#bcf60c", 19, "#bcf60c", 10, "#fabebe", 20, "#fabebe", "#888"];
+        let widthExpression = ["case", ["<", ["get", "facType"], 6], 4, 2];
+
+        function createInfoCard(properties) {
+            const osmWayId = properties.osmWayId || 'N/A';
+            const edgeKeyId = properties.edgeKeyId !== undefined ? properties.edgeKeyId : 'N/A';
+            const osmDirection = properties.osmDirection !== undefined ? properties.osmDirection : 'N/A';
+            const oneway = properties.oneway !== undefined ? properties.oneway : 'N/A';
+            const osmLink = osmWayId !== 'N/A'
+                ? `<a href="https://www.openstreetmap.org/way/${osmWayId}" target="_blank">${osmWayId}</a>`
+                : 'N/A';
+            return `<strong>OSM ID:</strong> ${osmLink}<br><strong>Highway:</strong> ${properties.highwayType || 'N/A'}<br><strong>EdgeKeyId:</strong> ${edgeKeyId}<br><strong>ONEWAY:</strong> ${oneway}<br><strong>OSM Direction:</strong> ${osmDirection}`;
+        }
+
+        function updateLineLayerStates() {
+            map.setPaintProperty('line-layer-osmdir-1', 'line-color', [
+                "case",
+                ["boolean", ["feature-state", "special"], false], "#ffff00", // Color para características especiales
+                ["boolean", ["feature-state", "selected"], false], "#00ff00", // Color para la forma seleccionada
+                ["boolean", ["feature-state", "flaggedSelected"], false], "#00ffff", // Color para la forma marcada seleccionada
+                colorExpression
+            ]);
+            map.setPaintProperty('line-layer-osmdir-1', 'line-width', [
+                "case",
+                ["boolean", ["feature-state", "hover"], false], 6,
+                ["boolean", ["feature-state", "flaggedSelected"], false], 5,
+                widthExpression
+            ]);
+            map.setPaintProperty('line-layer-osmdir--1', 'line-color', [
+                "case",
+                ["boolean", ["feature-state", "special"], false], "#ffff00", // Color para características especiales
+                ["boolean", ["feature-state", "selected"], false], "#00ff00", // Color para la forma seleccionada
+                ["boolean", ["feature-state", "flaggedSelected"], false], "#00ffff", // Color para la forma marcada seleccionada
+                colorExpression
+            ]);
+            map.setPaintProperty('line-layer-osmdir--1', 'line-width', [
+                "case",
+                ["boolean", ["feature-state", "hover"], false], 6,
+                ["boolean", ["feature-state", "flaggedSelected"], false], 5,
+                widthExpression
+            ]);
+            map.setPaintProperty('line-layer-default', 'line-color', [
+                "case",
+                ["boolean", ["feature-state", "special"], false], "#ffff00", // Color para características especiales
+                ["boolean", ["feature-state", "selected"], false], "#00ff00", // Color para la forma seleccionada
+                ["boolean", ["feature-state", "flaggedSelected"], false], "#00ffff", // Color para la forma marcada seleccionada
+                colorExpression
+            ]);
+            map.setPaintProperty('line-layer-default', 'line-width', [
+                "case",
+                ["boolean", ["feature-state", "hover"], false], 6,
+                ["boolean", ["feature-state", "flaggedSelected"], false], 5,
+                widthExpression
+            ]);
+        }
+
+
+        function loadFeatures() {
+            const bounds = map.getBounds();
+            const bufferFactor = 0.1;
+            const west = bounds.getWest();
+            const south = bounds.getSouth();
+            const east = bounds.getEast();
+            const north = bounds.getNorth();
+            const bufferX = (east - west) * bufferFactor;
+            const bufferY = (north - south) * bufferFactor;
+            const bbox = [west - bufferX, south - bufferY, east + bufferX, north + bufferY].join(',');
+            const filepath = document.getElementById('filepath').value;
+
+            const fetchUrl = filepath ? `/features?bbox=${bbox}&file=${encodeURIComponent(filepath)}` : `/features?bbox=${bbox}`;
+
+            fetch(fetchUrl)
+                .then(res => res.json())
+                .then(data => {
+                    if (map.getSource('geodata')) {
+                        map.getSource('geodata').setData(data);
+                    } else {
+                        map.addSource('geodata', { type: 'geojson', data: data });
+
+                        map.addLayer({
+                            id: 'polygon-layer',
+                            type: 'fill',
+                            source: 'geodata',
+                            paint: {
+                                'fill-color': '#088',
+                                'fill-opacity': 0.5
+                            },
+                            filter: ['==', '$type', 'Polygon']
+                        });
+
+                        map.addLayer({
+                            id: 'line-layer-osmdir-1',
+                            type: 'line',
+                            source: 'geodata',
+                            filter: [
+                                "all",
+                                ["==", ["geometry-type"], "LineString"],
+                                ["==", ["get", "oneway"], false],
+                                ["==", ["get", "osmDirection"], 1]
+                            ],
+                            paint: {
+                                'line-color': colorExpression,
+                                'line-width': widthExpression,
+                                'line-translate': [2, 2]
+                            }
+                        });
+
+                        map.addLayer({
+                            id: 'line-layer-osmdir--1',
+                            type: 'line',
+                            source: 'geodata',
+                            filter: [
+                                "all",
+                                ["==", ["geometry-type"], "LineString"],
+                                ["==", ["get", "oneway"], false],
+                                ["==", ["get", "osmDirection"], -1]
+                            ],
+                            paint: {
+                                'line-color': colorExpression,
+                                'line-width': widthExpression,
+                                'line-translate': [-1, -1]
+                            }
+                        });
+
+                        map.addLayer({
+                            id: 'line-layer-default',
+                            type: 'line',
+                            source: 'geodata',
+                            filter: [
+                                "all",
+                                ["==", ["geometry-type"], "LineString"],
+                                [
+                                    "any",
+                                    ["!=", ["get", "oneway"], false],
+                                    [
+                                        "all",
+                                        ["==", ["get", "oneway"], false],
+                                        ["!=", ["get", "osmDirection"], 1],
+                                        ["!=", ["get", "osmDirection"], -1]
+                                    ]
+                                ]
+                            ],
+                            paint: {
+                                'line-color': colorExpression,
+                                'line-width': widthExpression,
+                                'line-translate': [0, 0]
+                            }
+                        });
+
+                        map.addLayer({
+                            id: 'point-layer',
+                            type: 'circle',
+                            source: 'geodata',
+                            paint: {
+                                'circle-radius': 6,
+                                'circle-color': "#007cbf"
+                            },
+                            filter: ['==', '$type', 'Point']
+                        });
+
+                        map.on('mousemove', 'polygon-layer', setHover);
+                        map.on('mousemove', 'line-layer-osmdir-1', setHover);
+                        map.on('mousemove', 'line-layer-osmdir--1', setHover);
+                        map.on('mousemove', 'line-layer-default', setHover);
+                        map.on('mousemove', 'point-layer', setHover);
+                        map.on('mouseleave', 'polygon-layer', clearHover);
+                        map.on('mouseleave', 'line-layer-osmdir-1', clearHover);
+                        map.on('mouseleave', 'line-layer-osmdir--1', clearHover);
+                        map.on('mouseleave', 'line-layer-default', clearHover);
+                        map.on('mouseleave', 'point-layer', clearHover);
+                        map.on('click', 'polygon-layer', setSelected);
+                        map.on('click', 'line-layer-osmdir-1', setSelected);
+                        map.on('click', 'line-layer-osmdir--1', setSelected);
+                        map.on('click', 'line-layer-default', setSelected);
+                        map.on('click', 'point-layer', setSelected);
+                    }
+                });
+
+            fetch('/flagged_features')
+                .then(res => res.json())
+                .then(data => {
+                    flaggedFeatures = data.features;
+                    const flaggedSelect = document.getElementById('flagged-select');
+                    flaggedSelect.innerHTML = ''; // Clear existing options
+
+                    if (flaggedFeatures.length > 0) {
+                        flaggedFeatures.forEach((feature, index) => {
+                            const option = document.createElement('option');
+                            option.value = index;
+                            option.textContent = `EdgeKeyId: ${feature.properties.edgeKeyId}`;
+                            flaggedSelect.appendChild(option);
+                        });
+                        selectFlagged(0);
+                    } else {
+                        const option = document.createElement('option');
+                        option.value = '';
+                        option.textContent = 'No flagged shapes available';
+                        flaggedSelect.appendChild(option);
+                    }
+                });
+        }
+
+        function handleFlaggedSelectChange() {
+            const flaggedSelect = document.getElementById('flagged-select');
+            const selectedIndex = parseInt(flaggedSelect.value, 10);
+            if (!isNaN(selectedIndex)) {
+                selectFlagged(selectedIndex);
+            }
+        }
+
+        function setHover(e) {
+            if (e.features.length > 0) {
+                if (hoveredFeatureId !== null) {
+                    map.setFeatureState({ source: 'geodata', id: hoveredFeatureId }, { hover: false });
+                }
+                hoveredFeatureId = e.features[0].id;
+                map.setFeatureState({ source: 'geodata', id: hoveredFeatureId }, { hover: true });
+                updateLineLayerStates();
+                document.getElementById('info').innerHTML = createInfoCard(e.features[0].properties);
+            }
+        }
+
+        function clearHover() {
+            if (hoveredFeatureId !== null) {
+                map.setFeatureState({ source: 'geodata', id: hoveredFeatureId }, { hover: false });
+                updateLineLayerStates();
+            }
+            hoveredFeatureId = null;
+            document.getElementById('info').innerText = 'Hover over a shape';
+        }
+
+        function setSelected(e) {
+            if (e.features.length > 0) {
+                if (selectedFeatureId !== null) {
+                    map.setFeatureState({ source: 'geodata', id: selectedFeatureId }, { selected: false });
+                }
+                selectedFeatureId = e.features[0].id;
+                map.setFeatureState({ source: 'geodata', id: selectedFeatureId }, { selected: true });
+                updateLineLayerStates();
+                document.getElementById('selected').innerHTML = createInfoCard(e.features[0].properties);
+            }
+        }
+
+        function selectFlagged(index) {
+            if (flaggedFeatures.length > 0) {
+                // Restablecer el estado de la característica previamente seleccionada como marcada
+                if (flaggedSelectedIndex >= 0 && flaggedSelectedIndex < flaggedFeatures.length) {
+                    const previousFlaggedFeature = flaggedFeatures[flaggedSelectedIndex];
+                    map.setFeatureState(
+                        { source: 'geodata', id: previousFlaggedFeature.id },
+                        { flaggedSelected: false }
+                    );
+                }
+
+                // Actualizar el índice de la forma marcada seleccionada
+                flaggedSelectedIndex = (index + flaggedFeatures.length) % flaggedFeatures.length;
+                const flaggedFeature = flaggedFeatures[flaggedSelectedIndex];
+
+                // Establecer el estado de la nueva característica seleccionada como marcada
+                map.setFeatureState(
+                    { source: 'geodata', id: flaggedFeature.id },
+                    { flaggedSelected: true }
+                );
+                const flaggedSelect = document.getElementById('flagged-select');
+                flaggedSelect.value = flaggedSelectedIndex;
+
+
+                // Actualizar el contenido del cuadro de información de la forma marcada
+                // document.getElementById('flagged').innerHTML = `Flagged Shape EdgeKeyId: ${flaggedFeature.properties.edgeKeyId}`;
+            }
+        }
+
+
+        function zoomToFlagged() {
+            if (flaggedFeatures.length > 0 && flaggedSelectedIndex >= 0) {
+                const geometry = flaggedFeatures[flaggedSelectedIndex].geometry;
+                const coordinates = geometry.coordinates.flat(Infinity);
+                const lons = coordinates.filter((_, i) => i % 2 === 0);
+                const lats = coordinates.filter((_, i) => i % 2 === 1);
+                const bounds = [
+                    [Math.min(...lons), Math.min(...lats)],
+                    [Math.max(...lons), Math.max(...lats)]
+                ];
+                map.fitBounds(bounds, { padding: 40 });
+            }
+        }
+
+        document.getElementById('refresh').addEventListener('click', loadFeatures);
+
+        map = new maplibregl.Map({
+            container: 'map',
+            style: 'https://tiles.stadiamaps.com/styles/osm_bright.json',
+            center: [0, 0],
+            zoom: 2
+        });
+
+        map.on('load', loadFeatures);
+
+        let specialFeatures = [];
+        let isDrawing = false;
+        let startPoint = null;
+        let endPoint = null;
+        let bboxLayer = null;
+
+        // Detectar Shift + clic izquierdo para iniciar el dibujo del bbox
+        map.on('mousedown', (e) => {
+            if (e.originalEvent.shiftKey && e.originalEvent.button === 0) {
+                e.preventDefault(); // Evita el comportamiento predeterminado del mapa
+                isDrawing = true;
+                startPoint = e.lngLat;
+                endPoint = null;
+
+                // Crear una capa temporal para mostrar el bbox
+                if (!map.getSource('bbox')) {
+                    map.addSource('bbox', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+                    map.addLayer({
+                        id: 'bbox-layer',
+                        type: 'fill',
+                        source: 'bbox',
+                        paint: {
+                            'fill-color': '#888',
+                            'fill-opacity': 0.3
+                        }
+                    });
+                }
+            }
+        });
+
+        // Actualizar el bbox mientras se arrastra el mouse
+        map.on('mousemove', (e) => {
+            if (isDrawing) {
+                endPoint = e.lngLat;
+
+                const bbox = turf.bboxPolygon([startPoint.lng, startPoint.lat, endPoint.lng, endPoint.lat]);
+                map.getSource('bbox').setData(bbox);
+            }
+        });
+
+        // Finalizar el dibujo del bbox y seleccionar características
+        map.on('mouseup', (e) => {
+            if (isDrawing) {
+                e.preventDefault(); // Evita el comportamiento predeterminado del mapa
+                isDrawing = false;
+                endPoint = e.lngLat;
+
+
+                // Convierte las coordenadas geográficas a coordenadas de píxeles
+                const startPointPixels = map.project(startPoint);
+                const endPointPixels = map.project(endPoint);
+
+                const bbox = [
+                    [Math.min(startPointPixels.x, endPointPixels.x), Math.min(startPointPixels.y, endPointPixels.y)],
+                    [Math.max(startPointPixels.x, endPointPixels.x), Math.max(startPointPixels.y, endPointPixels.y)]
+                ];
+
+                // Obtener características dentro del bbox
+                const features = map.queryRenderedFeatures(bbox, { layers: ['polygon-layer', 'line-layer-osmdir-1', 'line-layer-osmdir--1', 'line-layer-default'] });
+
+                features.forEach((feature) => {
+                    if (!specialFeatures.some((f) => f.id === feature.id)) {
+                        specialFeatures.push(feature);
+                        addFeatureToSpecialList(feature);
+                    }
+                });
+
+                // Limpiar el bbox temporal
+                map.getSource('bbox').setData({ type: 'FeatureCollection', features: [] });
+            }
+        });
+
+        // Agregar una característica a la lista de "features especiales"
+        function addFeatureToSpecialList(feature) {
+            const list = document.getElementById('special-features-list');
+            const listItem = document.createElement('li');
+            listItem.textContent = `EdgeKeyId: ${feature.properties.edgeKeyId}`;
+            listItem.dataset.featureId = feature.id;
+
+            // Establecer el estado especial para la característica
+            map.setFeatureState({ source: 'geodata', id: feature.id }, { special: true });
+
+
+            // Seleccionar y hacer zoom al hacer clic en la característica
+            listItem.addEventListener('click', (e) => {
+                e.stopPropagation(); // Evita que otros eventos interfieran
+                setSelected({ features: [feature] });
+
+                const geometry = feature.geometry;
+                const coordinates = geometry.coordinates.flat(Infinity);
+                const lons = coordinates.filter((_, i) => i % 2 === 0);
+                const lats = coordinates.filter((_, i) => i % 2 === 1);
+                const bounds = [
+                    [Math.min(...lons), Math.min(...lats)],
+                    [Math.max(...lons), Math.max(...lats)]
+                ];
+                map.fitBounds(bounds, { padding: 40 });
+            });
+
+
+            // Botón para eliminar la característica de la lista
+            const removeButton = document.createElement('button');
+            removeButton.textContent = 'Remove';
+            removeButton.style.marginLeft = '10px';
+            removeButton.addEventListener('click', (e) => {
+                e.stopPropagation();
+                specialFeatures = specialFeatures.filter((f) => f.id !== feature.id);
+                listItem.remove();
+                map.setFeatureState({ source: 'geodata', id: feature.id }, { special: false });
+            });
+
+            listItem.appendChild(removeButton);
+            list.appendChild(listItem);
+        }
+        document.getElementById('clear-special-features').addEventListener('click', () => {
+            // Restablecer el estado especial de todas las características
+            specialFeatures.forEach((feature) => {
+                map.setFeatureState({ source: 'geodata', id: feature.id }, { special: false });
+            });
+
+            // Limpia la lista de características especiales
+            specialFeatures = [];
+
+            // Limpia el contenido del elemento <ul>
+            const list = document.getElementById('special-features-list');
+            list.innerHTML = '';
+        });
+
+        document.getElementById('copy-osmwayids').addEventListener('click', () => {
+            // Extraer los OsmWayId de las características especiales
+            const osmWayIds = specialFeatures
+                .map((feature) => feature.properties.osmWayId) // Obtener los OsmWayId
+                .filter((id, index, self) => id !== undefined && self.indexOf(id) === index); // Eliminar duplicados y valores undefined
+
+            // Convertir la lista en un string separado por nuevas líneas
+            const osmWayIdsText = osmWayIds.join('\n');
+
+            // Copiar al portapapeles
+            navigator.clipboard.writeText(osmWayIdsText)
+                .then(() => {
+                    alert('OsmWayIds copied to clipboard!');
+                })
+                .catch((err) => {
+                    console.error('Failed to copy OsmWayIds:', err);
+                });
+        });
+
+    </script>
+</body>
+
+</html>
